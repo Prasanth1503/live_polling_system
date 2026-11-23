@@ -1,7 +1,6 @@
 
-import React, { useEffect, useState } from "react";
-
-const API = import.meta.env.VITE_API_URL || "http://localhost:8080/api";
+import React, { useEffect, useState, useCallback } from "react";
+import { API, getApiResponse } from "./api";
 
 export default function PublicPoll() {
     const pollId = window.location.pathname.split("/").pop();
@@ -11,23 +10,28 @@ export default function PublicPoll() {
     const [message, setMessage] = useState("");
     const [loading, setLoading] = useState(true);
     const [voted, setVoted] = useState(false);
+    const [submitting, setSubmitting] = useState(false);
 
-    async function loadPoll() {
+    const loadPoll = useCallback(async () => {
         try {
             const response = await fetch(`${API}/polls/${pollId}`);
-            const data = await response.json();
+
+            const data = await getApiResponse(response);
 
             if (!response.ok) {
-                throw new Error(data.error || "Poll not found");
+                throw new Error(data.error || "Unable to load poll");
             }
 
-            setPoll(data.poll || data);
-        } catch (err) {
-            setMessage(err.message);
+            const pollData = data.poll || data;
+
+            setPoll(pollData);
+            setMessage("");
+        } catch (error) {
+            setMessage(error.message || "Failed to fetch poll");
         } finally {
             setLoading(false);
         }
-    }
+    }, [pollId]);
 
     useEffect(() => {
         loadPoll();
@@ -35,10 +39,15 @@ export default function PublicPoll() {
         const timer = setInterval(loadPoll, 2000);
 
         return () => clearInterval(timer);
-    }, [pollId]);
+    }, [loadPoll]);
 
     async function submitVote() {
-        if (selected === null || voted) return;
+        if (selected === null || voted || submitting) {
+            return;
+        }
+
+        setSubmitting(true);
+        setMessage("");
 
         try {
             const response = await fetch(
@@ -54,7 +63,7 @@ export default function PublicPoll() {
                 }
             );
 
-            const data = await response.json();
+            const data = await getApiResponse(response);
 
             if (!response.ok) {
                 throw new Error(data.error || "Voting failed");
@@ -64,14 +73,19 @@ export default function PublicPoll() {
             setMessage("Your vote was submitted successfully!");
 
             await loadPoll();
-
-        } catch (err) {
-            setMessage(err.message);
+        } catch (error) {
+            setMessage(error.message || "Unable to submit vote");
+        } finally {
+            setSubmitting(false);
         }
     }
 
     if (loading) {
-        return <div className="public-poll">Loading poll...</div>;
+        return (
+            <div className="public-poll">
+                <h2>Loading poll...</h2>
+            </div>
+        );
     }
 
     if (!poll) {
@@ -79,9 +93,20 @@ export default function PublicPoll() {
             <div className="public-poll">
                 <h2>Poll Not Found</h2>
                 <p>{message}</p>
+                <button onClick={loadPoll}>Try Again</button>
             </div>
         );
     }
+
+    const options = Array.isArray(poll.options)
+        ? poll.options
+        : [];
+
+    const totalVotes = Number(poll.totalVotes || 0);
+
+    const counts = Array.isArray(poll.counts)
+        ? poll.counts
+        : [];
 
     return (
         <div className="public-poll">
@@ -92,12 +117,12 @@ export default function PublicPoll() {
             <h2>{poll.question}</h2>
 
             <p className="muted">
-                Total Votes: {poll.totalVotes || 0}
+                Total Votes: {totalVotes}
             </p>
 
             {!voted && (
                 <>
-                    {poll.options?.map((option, index) => (
+                    {options.map((option, index) => (
                         <label className="poll-option" key={index}>
                             <input
                                 type="radio"
@@ -111,24 +136,26 @@ export default function PublicPoll() {
 
                     <button
                         onClick={submitVote}
-                        disabled={selected === null}
+                        disabled={selected === null || submitting}
                     >
-                        Submit Vote
+                        {submitting ? "Submitting..." : "Submit Vote"}
                     </button>
                 </>
             )}
 
             {message && (
-                <div className="success">{message}</div>
+                <div className="success">
+                    {message}
+                </div>
             )}
 
             <h2>Live Results</h2>
 
-            {poll.options?.map((option, index) => {
-                const count = poll.counts?.[index] || 0;
+            {options.map((option, index) => {
+                const count = Number(counts[index] || 0);
 
-                const percentage = poll.totalVotes
-                    ? (count / poll.totalVotes) * 100
+                const percentage = totalVotes > 0
+                    ? (count / totalVotes) * 100
                     : 0;
 
                 return (
@@ -141,7 +168,9 @@ export default function PublicPoll() {
                         <div className="progress">
                             <div
                                 className="progress-fill"
-                                style={{ width: `${percentage}%` }}
+                                style={{
+                                    width: `${percentage}%`
+                                }}
                             />
                         </div>
                     </div>

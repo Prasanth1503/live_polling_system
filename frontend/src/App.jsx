@@ -1,9 +1,7 @@
 
 import React, { useEffect, useState } from "react";
 import PublicPoll from "./PublicPoll";
-
-const API =
-    import.meta.env.VITE_API_URL || "http://localhost:8080/api";
+import { API, getApiResponse } from "./api";
 
 function Dashboard() {
     // Authentication states
@@ -30,77 +28,85 @@ function Dashboard() {
     const [success, setSuccess] = useState("");
     const [loading, setLoading] = useState(false);
 
-    // Handle backend JSON response
-    async function getResponse(response) {
-        const text = await response.text();
+// LOGIN / SIGNUP
+async function auth() {
+    setError("");
+    setSuccess("");
 
-        try {
-            return text ? JSON.parse(text) : {};
-        } catch {
-            throw new Error("Invalid backend response.");
-        }
+    const cleanEmail = email.trim().toLowerCase();
+
+    if (!cleanEmail || !password) {
+        setError("Please enter email and password.");
+        return;
     }
 
-    // LOGIN / SIGNUP
-    async function auth() {
-        setError("");
-        setSuccess("");
-
-        if (!email.trim() || !password.trim()) {
-            setError("Please enter email and password.");
-            return;
-        }
-
-        try {
-            setLoading(true);
-
-            const response = await fetch(
-                `${API}/auth/${isSignup ? "signup" : "login"}`,
-                {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json"
-                    },
-                    body: JSON.stringify({
-                        email: email.trim(),
-                        password
-                    })
-                }
-            );
-
-            const data = await getResponse(response);
-
-            if (!response.ok) {
-                throw new Error(
-                    data.error || "Authentication failed."
-                );
-            }
-
-            if (!data.token) {
-                throw new Error(
-                    "Backend did not return a token."
-                );
-            }
-
-            localStorage.setItem("token", data.token);
-            localStorage.setItem("email", email.trim());
-
-            setToken(data.token);
-            setUser(email.trim());
-            setPassword("");
-
-            setSuccess(
-                isSignup
-                    ? "Account created successfully!"
-                    : "Login successful!"
-            );
-
-        } catch (err) {
-            setError(err.message);
-        } finally {
-            setLoading(false);
-        }
+    if (isSignup && password.length < 8) {
+        setError("Password must contain at least 8 characters.");
+        return;
     }
+
+    const endpoint = isSignup ? "signup" : "login";
+    const url = `${API}/auth/${endpoint}`;
+
+    try {
+        setLoading(true);
+
+        console.log("Authentication URL:", url);
+
+        const response = await fetch(url, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            },
+            body: JSON.stringify({
+                email: cleanEmail,
+                password
+            })
+        });
+
+        const data = await getApiResponse(response);
+
+        console.log("Authentication response:", response.status, data);
+
+        if (!response.ok) {
+            throw new Error(
+                data.error || data.message || `Request failed: ${response.status}`
+            );
+        }
+
+        if (!data.token) {
+            throw new Error("Backend did not return a JWT token.");
+        }
+
+        localStorage.setItem("token", data.token);
+        localStorage.setItem("email", data.user?.email || cleanEmail);
+
+        setToken(data.token);
+        setUser(data.user?.email || cleanEmail);
+        setPassword("");
+
+        setSuccess(
+            isSignup
+                ? "Account created successfully!"
+                : "Login successful!"
+        );
+
+    } catch (err) {
+        console.error("Authentication error:", err);
+
+        if (err instanceof TypeError) {
+            setError(
+                "Cannot connect to backend. Check the API URL, backend server and CORS settings."
+            );
+        } else {
+            setError(err.message || "Authentication failed.");
+        }
+    } finally {
+        setLoading(false);
+    }
+}
+
 
     // LOAD POLLS
     async function loadPolls() {
@@ -114,7 +120,7 @@ function Dashboard() {
                 }
             });
 
-            const data = await getResponse(response);
+            const data = await getApiResponse(response);
 
             if (!response.ok) {
                 throw new Error(
@@ -195,7 +201,7 @@ function Dashboard() {
                 })
             });
 
-            const data = await getResponse(response);
+            const data = await getApiResponse(response);
 
             if (!response.ok) {
                 throw new Error(
