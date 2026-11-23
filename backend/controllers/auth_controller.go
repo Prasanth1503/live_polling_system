@@ -24,6 +24,40 @@ type AuthController struct {
 	JWTSecret  string
 }
 
+// JWT Claims
+type AuthClaims struct {
+	UserID string `json:"userId"`
+	jwt.RegisteredClaims
+}
+
+// Generate database context
+func (ac AuthController) databaseContext(c *gin.Context) (
+	context.Context,
+	context.CancelFunc,
+) {
+	return context.WithTimeout(c.Request.Context(), 5*time.Second)
+}
+
+// Validate controller configuration
+func (ac AuthController) isConfigured(c *gin.Context) bool {
+
+	if ac.Collection == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Database collection is not configured",
+		})
+		return false
+	}
+
+	if len(ac.JWTSecret) < 32 {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "JWT secret must contain at least 32 characters",
+		})
+		return false
+	}
+
+	return true
+}
+
 // ===============================
 // SIGNUP
 // ===============================
@@ -32,15 +66,13 @@ func (ac AuthController) Signup(c *gin.Context) {
 
 	var req models.AuthRequest
 
-	// Read JSON request
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Invalid request",
+			"error": "Invalid request. Enter email and password.",
 		})
 		return
 	}
 
-	// Validate email
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 
 	if email == "" || !strings.Contains(email, "@") {
@@ -50,7 +82,6 @@ func (ac AuthController) Signup(c *gin.Context) {
 		return
 	}
 
-	// Validate password
 	if len(req.Password) < 8 {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "Password must contain at least 8 characters",
@@ -58,27 +89,22 @@ func (ac AuthController) Signup(c *gin.Context) {
 		return
 	}
 
-	if ac.Collection == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Database collection is not configured",
+	// bcrypt supports passwords up to 72 bytes
+	if len([]byte(req.Password)) > 72 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Password must not exceed 72 bytes",
 		})
 		return
 	}
 
-	if len(ac.JWTSecret) < 32 {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "JWT secret is not configured correctly",
-		})
+	if !ac.isConfigured(c) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(
-		c.Request.Context(),
-		5*time.Second,
-	)
+	ctx, cancel := ac.databaseContext(c)
 	defer cancel()
 
-	// Check existing user
+	// Check existing email
 	var existing models.User
 
 	err := ac.Collection.FindOne(ctx, bson.M{
@@ -122,13 +148,19 @@ func (ac AuthController) Signup(c *gin.Context) {
 	result, err := ac.Collection.InsertOne(ctx, user)
 
 	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "Email already registered",
+			})
+			return
+		}
+
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Could not create account",
 		})
 		return
 	}
 
-	// Validate MongoDB ID
 	insertedID, ok := result.InsertedID.(primitive.ObjectID)
 
 	if !ok {
@@ -140,7 +172,7 @@ func (ac AuthController) Signup(c *gin.Context) {
 
 	user.ID = insertedID
 
-	// Generate JWT token
+	// Generate JWT
 	token, err := ac.createToken(user.ID.Hex())
 
 	if err != nil {
@@ -150,7 +182,6 @@ func (ac AuthController) Signup(c *gin.Context) {
 		return
 	}
 
-	// Success response
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Signup successful",
 		"token":   token,
@@ -169,7 +200,6 @@ func (ac AuthController) Login(c *gin.Context) {
 
 	var req models.AuthRequest
 
-	// Read JSON request
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "Invalid request",
@@ -186,24 +216,11 @@ func (ac AuthController) Login(c *gin.Context) {
 		return
 	}
 
-	if ac.Collection == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Database collection is not configured",
-		})
+	if !ac.isConfigured(c) {
 		return
 	}
 
-	if len(ac.JWTSecret) < 32 {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "JWT secret is not configured correctly",
-		})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(
-		c.Request.Context(),
-		5*time.Second,
-	)
+	ctx, cancel := ac.databaseContext(c)
 	defer cancel()
 
 	// Find user
@@ -214,13 +231,20 @@ func (ac AuthController) Login(c *gin.Context) {
 	}).Decode(&user)
 
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": "Invalid email or password",
+		if err == mongo.ErrNoDocuments {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "Invalid email or password",
+			})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Database error",
 		})
 		return
 	}
 
-	// Verify password
+	// Check password
 	err = bcrypt.CompareHashAndPassword(
 		[]byte(user.PasswordHash),
 		[]byte(req.Password),
@@ -233,7 +257,7 @@ func (ac AuthController) Login(c *gin.Context) {
 		return
 	}
 
-	// Generate JWT token
+	// Generate token
 	token, err := ac.createToken(user.ID.Hex())
 
 	if err != nil {
@@ -243,7 +267,6 @@ func (ac AuthController) Login(c *gin.Context) {
 		return
 	}
 
-	// Success response
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Login successful",
 		"token":   token,
@@ -260,10 +283,13 @@ func (ac AuthController) Login(c *gin.Context) {
 
 func (ac AuthController) createToken(userID string) (string, error) {
 
-	claims := jwt.MapClaims{
-		"userId": userID,
-		"exp":    time.Now().Add(24 * time.Hour).Unix(),
-		"iat":    time.Now().Unix(),
+	claims := AuthClaims{
+		UserID: userID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   userID,
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
 	}
 
 	token := jwt.NewWithClaims(
