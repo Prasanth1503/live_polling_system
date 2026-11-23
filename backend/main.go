@@ -1,20 +1,17 @@
-
 package main
 
 import (
 	"context"
 	"fmt"
-	"log"
-	"net/http"
-	"os"
-	"strings"
-	"time"
-
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
+	"log"
+	"os"
+	"strings"
+	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -26,9 +23,8 @@ var (
 	userCollection *mongo.Collection
 	pollCollection *mongo.Collection
 	jwtSecret      []byte
+	frontendURL    string
 )
-
-// ================= USER MODEL =================
 
 type User struct {
 	ID           primitive.ObjectID `json:"id" bson:"_id,omitempty"`
@@ -36,8 +32,6 @@ type User struct {
 	PasswordHash string             `json:"-" bson:"passwordHash"`
 	CreatedAt    time.Time          `json:"createdAt" bson:"createdAt"`
 }
-
-// ================= POLL MODEL =================
 
 type Poll struct {
 	ID         primitive.ObjectID `json:"id" bson:"_id,omitempty"`
@@ -49,21 +43,28 @@ type Poll struct {
 	CreatedAt  time.Time          `json:"createdAt" bson:"createdAt"`
 }
 
-// ================= RESPONSE HELPERS =================
-
-func successResponse(c *gin.Context, status int, data gin.H) {
+func success(c *gin.Context, status int, data gin.H) {
 	data["success"] = true
 	c.JSON(status, data)
 }
 
-func errorResponse(c *gin.Context, status int, message string) {
+func failure(c *gin.Context, status int, message string) {
 	c.JSON(status, gin.H{
 		"success": false,
 		"error":   message,
 	})
 }
 
-// ================= SIGNUP =================
+func createToken(userID string) (string, error) {
+	claims := jwt.MapClaims{
+		"userId": userID,
+		"exp":    time.Now().Add(24 * time.Hour).Unix(),
+		"iat":    time.Now().Unix(),
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSecret)
+}
 
 func Signup(c *gin.Context) {
 	var input struct {
@@ -72,15 +73,19 @@ func Signup(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		errorResponse(c, http.StatusBadRequest, "Invalid request")
+		failure(c, 400, "Invalid request data")
 		return
 	}
 
 	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
 
-	if input.Email == "" || len(input.Password) < 8 {
-		errorResponse(c, http.StatusBadRequest,
-			"Email is required and password must be at least 8 characters")
+	if !strings.Contains(input.Email, "@") || len(input.Email) < 5 {
+		failure(c, 400, "Enter a valid email")
+		return
+	}
+
+	if len(input.Password) < 8 {
+		failure(c, 400, "Password must contain at least 8 characters")
 		return
 	}
 
@@ -89,7 +94,7 @@ func Signup(c *gin.Context) {
 		bcrypt.DefaultCost,
 	)
 	if err != nil {
-		errorResponse(c, http.StatusInternalServerError, "Password processing failed")
+		failure(c, 500, "Password processing failed")
 		return
 	}
 
@@ -99,31 +104,37 @@ func Signup(c *gin.Context) {
 		CreatedAt:    time.Now(),
 	}
 
-	result, err := userCollection.InsertOne(c.Request.Context(), user)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	result, err := userCollection.InsertOne(ctx, user)
 	if err != nil {
-		errorResponse(c, http.StatusConflict, "Email may already be registered")
+		if mongo.IsDuplicateKeyError(err) {
+			failure(c, 409, "Email already registered")
+			return
+		}
+		log.Println("Signup error:", err)
+		failure(c, 500, "Could not register user")
 		return
 	}
 
-	user.ID = result.InsertedID.(primitive.ObjectID)
+	id := result.InsertedID.(primitive.ObjectID)
 
-	token, err := createToken(user.ID.Hex())
+	token, err := createToken(id.Hex())
 	if err != nil {
-		errorResponse(c, http.StatusInternalServerError, "Could not create token")
+		failure(c, 500, "Could not create token")
 		return
 	}
 
-	successResponse(c, http.StatusCreated, gin.H{
+	success(c, 201, gin.H{
 		"message": "Signup successful",
 		"token":   token,
 		"user": gin.H{
-			"id":    user.ID.Hex(),
+			"id":    id.Hex(),
 			"email": user.Email,
 		},
 	})
 }
-
-// ================= LOGIN =================
 
 func Login(c *gin.Context) {
 	var input struct {
@@ -132,41 +143,47 @@ func Login(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		errorResponse(c, http.StatusBadRequest, "Invalid request")
+		failure(c, 400, "Invalid request data")
 		return
 	}
 
 	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
 
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
 	var user User
 
 	err := userCollection.FindOne(
-		c.Request.Context(),
+		ctx,
 		bson.M{"email": input.Email},
 	).Decode(&user)
 
 	if err != nil {
-		errorResponse(c, http.StatusUnauthorized, "Invalid email or password")
+		if err == mongo.ErrNoDocuments {
+			failure(c, 401, "Invalid email or password")
+			return
+		}
+		log.Println("Login error:", err)
+		failure(c, 500, "Database error")
 		return
 	}
 
-	err = bcrypt.CompareHashAndPassword(
+	if err := bcrypt.CompareHashAndPassword(
 		[]byte(user.PasswordHash),
 		[]byte(input.Password),
-	)
-
-	if err != nil {
-		errorResponse(c, http.StatusUnauthorized, "Invalid email or password")
+	); err != nil {
+		failure(c, 401, "Invalid email or password")
 		return
 	}
 
 	token, err := createToken(user.ID.Hex())
 	if err != nil {
-		errorResponse(c, http.StatusInternalServerError, "Could not create token")
+		failure(c, 500, "Could not create token")
 		return
 	}
 
-	successResponse(c, http.StatusOK, gin.H{
+	success(c, 200, gin.H{
 		"message": "Login successful",
 		"token":   token,
 		"user": gin.H{
@@ -176,38 +193,22 @@ func Login(c *gin.Context) {
 	})
 }
 
-// ================= JWT =================
-
-func createToken(userID string) (string, error) {
-	claims := jwt.MapClaims{
-		"userId": userID,
-		"exp":    time.Now().Add(24 * time.Hour).Unix(),
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-
-	return token.SignedString(jwtSecret)
-}
-
-// ================= AUTH MIDDLEWARE =================
-
 func AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-
 		header := c.GetHeader("Authorization")
 
 		if !strings.HasPrefix(header, "Bearer ") {
-			errorResponse(c, http.StatusUnauthorized, "Authorization token required")
+			failure(c, 401, "Authorization token required")
 			c.Abort()
 			return
 		}
 
-		tokenString := strings.TrimPrefix(header, "Bearer ")
+		tokenString := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
 
 		token, err := jwt.Parse(
 			tokenString,
-			func(token *jwt.Token) (interface{}, error) {
-				if token.Method.Alg() != jwt.SigningMethodHS256.Alg() {
+			func(t *jwt.Token) (interface{}, error) {
+				if t.Method != jwt.SigningMethodHS256 {
 					return nil, fmt.Errorf("unexpected signing method")
 				}
 				return jwtSecret, nil
@@ -216,21 +217,27 @@ func AuthMiddleware() gin.HandlerFunc {
 		)
 
 		if err != nil || token == nil || !token.Valid {
-			errorResponse(c, http.StatusUnauthorized, "Invalid or expired token")
+			failure(c, 401, "Invalid or expired token")
 			c.Abort()
 			return
 		}
 
 		claims, ok := token.Claims.(jwt.MapClaims)
 		if !ok {
-			errorResponse(c, http.StatusUnauthorized, "Invalid token claims")
+			failure(c, 401, "Invalid token claims")
 			c.Abort()
 			return
 		}
 
 		userID, ok := claims["userId"].(string)
-		if !ok || userID == "" {
-			errorResponse(c, http.StatusUnauthorized, "Invalid user")
+		if !ok {
+			failure(c, 401, "Invalid user")
+			c.Abort()
+			return
+		}
+
+		if _, err := primitive.ObjectIDFromHex(userID); err != nil {
+			failure(c, 401, "Invalid user ID")
 			c.Abort()
 			return
 		}
@@ -240,87 +247,83 @@ func AuthMiddleware() gin.HandlerFunc {
 	}
 }
 
-// ================= CREATE POLL =================
-
 func CreatePoll(c *gin.Context) {
-
 	var input struct {
 		Question string   `json:"question"`
 		Options  []string `json:"options"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		errorResponse(c, http.StatusBadRequest, "Invalid poll data")
+		failure(c, 400, "Invalid poll data")
 		return
 	}
 
 	input.Question = strings.TrimSpace(input.Question)
 
 	if input.Question == "" {
-		errorResponse(c, http.StatusBadRequest, "Question is required")
+		failure(c, 400, "Question is required")
 		return
 	}
 
 	if len(input.Options) < 2 || len(input.Options) > 6 {
-		errorResponse(c, http.StatusBadRequest, "Provide between 2 and 6 options")
+		failure(c, 400, "Provide between 2 and 6 options")
 		return
 	}
 
 	for i := range input.Options {
 		input.Options[i] = strings.TrimSpace(input.Options[i])
-
 		if input.Options[i] == "" {
-			errorResponse(c, http.StatusBadRequest, "Options cannot be empty")
+			failure(c, 400, "Options cannot be empty")
 			return
 		}
 	}
 
 	userID, exists := c.Get("userID")
 	if !exists {
-		errorResponse(c, http.StatusUnauthorized, "Login required")
+		failure(c, 401, "Login required")
 		return
 	}
 
 	poll := Poll{
-		Question:   input.Question,
-		Options:    input.Options,
-		Counts:     make([]int, len(input.Options)),
-		TotalVotes: 0,
-		OwnerID:    userID.(string),
-		CreatedAt:  time.Now(),
+		Question:  input.Question,
+		Options:   input.Options,
+		Counts:    make([]int, len(input.Options)),
+		OwnerID:   userID.(string),
+		CreatedAt: time.Now(),
 	}
 
-	result, err := pollCollection.InsertOne(
-		c.Request.Context(),
-		poll,
-	)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
 
+	result, err := pollCollection.InsertOne(ctx, poll)
 	if err != nil {
-		errorResponse(c, http.StatusInternalServerError, "Could not create poll")
+		log.Println("Create poll error:", err)
+		failure(c, 500, "Could not create poll")
 		return
 	}
 
 	poll.ID = result.InsertedID.(primitive.ObjectID)
 
-	successResponse(c, http.StatusCreated, gin.H{
+	success(c, 201, gin.H{
 		"message": "Poll created successfully",
 		"poll":    poll,
-		"shareUrl": "http://localhost:5173/poll/" + poll.ID.Hex(),
+		"shareUrl": frontendURL +
+			"/poll/" + poll.ID.Hex(),
 	})
 }
 
-// ================= ADMIN POLLS =================
-
 func GetPolls(c *gin.Context) {
-
 	userID, exists := c.Get("userID")
 	if !exists {
-		errorResponse(c, http.StatusUnauthorized, "Login required")
+		failure(c, 401, "Login required")
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
 	cursor, err := pollCollection.Find(
-		c.Request.Context(),
+		ctx,
 		bson.M{"ownerId": userID.(string)},
 		options.Find().SetSort(
 			bson.D{{Key: "createdAt", Value: -1}},
@@ -328,76 +331,51 @@ func GetPolls(c *gin.Context) {
 	)
 
 	if err != nil {
-		errorResponse(c, http.StatusInternalServerError, "Could not load polls")
+		log.Println("Get polls error:", err)
+		failure(c, 500, "Could not load polls")
 		return
 	}
-
-	defer cursor.Close(c.Request.Context())
+	defer cursor.Close(ctx)
 
 	polls := []Poll{}
-
-	if err := cursor.All(c.Request.Context(), &polls); err != nil {
-		errorResponse(c, http.StatusInternalServerError, "Could not read polls")
+	if err := cursor.All(ctx, &polls); err != nil {
+		failure(c, 500, "Could not read polls")
 		return
 	}
 
-	successResponse(c, http.StatusOK, gin.H{
-		"polls": polls,
-	})
+	success(c, 200, gin.H{"polls": polls})
 }
 
-// ================= PUBLIC POLL =================
-
 func GetPublicPoll(c *gin.Context) {
-
-	id := c.Param("id")
-
-	objectID, err := primitive.ObjectIDFromHex(id)
-
+	id, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
-		errorResponse(c, http.StatusBadRequest, "Invalid poll ID")
+		failure(c, 400, "Invalid poll ID")
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(
-		c.Request.Context(),
-		5*time.Second,
-	)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
 	var poll Poll
-
-	err = pollCollection.FindOne(
-		ctx,
-		bson.M{"_id": objectID},
-	).Decode(&poll)
+	err = pollCollection.FindOne(ctx, bson.M{"_id": id}).Decode(&poll)
 
 	if err != nil {
-
 		if err == mongo.ErrNoDocuments {
-			errorResponse(c, http.StatusNotFound, "Poll not found")
+			failure(c, 404, "Poll not found")
 			return
 		}
-
-		errorResponse(c, http.StatusInternalServerError, "Could not load poll")
+		log.Println("Get public poll error:", err)
+		failure(c, 500, "Could not load poll")
 		return
 	}
 
-	successResponse(c, http.StatusOK, gin.H{
-		"poll": poll,
-	})
+	success(c, 200, gin.H{"poll": poll})
 }
 
-// ================= PUBLIC VOTING =================
-
 func SubmitPublicVote(c *gin.Context) {
-
-	id := c.Param("id")
-
-	objectID, err := primitive.ObjectIDFromHex(id)
-
+	id, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
-		errorResponse(c, http.StatusBadRequest, "Invalid poll ID")
+		failure(c, 400, "Invalid poll ID")
 		return
 	}
 
@@ -406,103 +384,95 @@ func SubmitPublicVote(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		errorResponse(c, http.StatusBadRequest, "Invalid vote data")
+		failure(c, 400, "Invalid vote data")
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(
-		c.Request.Context(),
-		5*time.Second,
-	)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
 	var poll Poll
-
-	err = pollCollection.FindOne(
-		ctx,
-		bson.M{"_id": objectID},
-	).Decode(&poll)
+	err = pollCollection.FindOne(ctx, bson.M{"_id": id}).Decode(&poll)
 
 	if err != nil {
-
 		if err == mongo.ErrNoDocuments {
-			errorResponse(c, http.StatusNotFound, "Poll not found")
+			failure(c, 404, "Poll not found")
 			return
 		}
-
-		errorResponse(c, http.StatusInternalServerError, "Could not load poll")
+		failure(c, 500, "Could not load poll")
 		return
 	}
 
-	if input.OptionIndex < 0 ||
-		input.OptionIndex >= len(poll.Options) {
-		errorResponse(c, http.StatusBadRequest, "Invalid option selected")
+	if input.OptionIndex < 0 || input.OptionIndex >= len(poll.Options) {
+		failure(c, 400, "Invalid option selected")
 		return
 	}
 
 	if len(poll.Counts) != len(poll.Options) {
-		errorResponse(c, http.StatusInternalServerError, "Poll vote data is inconsistent")
+		failure(c, 500, "Poll vote data is inconsistent")
 		return
 	}
 
-	updatePath := fmt.Sprintf("counts.%d", input.OptionIndex)
+	path := fmt.Sprintf("counts.%d", input.OptionIndex)
 
 	result, err := pollCollection.UpdateOne(
 		ctx,
-		bson.M{
-			"_id": objectID,
-			updatePath: bson.M{"$exists": true},
-		},
+		bson.M{"_id": id},
 		bson.M{
 			"$inc": bson.M{
-				updatePath:  1,
+				path:         1,
 				"totalVotes": 1,
 			},
 		},
 	)
 
 	if err != nil {
-		errorResponse(c, http.StatusInternalServerError, "Could not save vote")
+		log.Println("Vote update error:", err)
+		failure(c, 500, "Could not save vote")
 		return
 	}
 
 	if result.MatchedCount == 0 {
-		errorResponse(c, http.StatusConflict, "Poll vote data changed; reload the poll")
+		failure(c, 404, "Poll not found")
 		return
 	}
 
-	// Load updated poll results
-	err = pollCollection.FindOne(
+	if err := pollCollection.FindOne(
 		ctx,
-		bson.M{"_id": objectID},
-	).Decode(&poll)
-
-	if err != nil {
-		errorResponse(c, http.StatusInternalServerError, "Could not load updated results")
+		bson.M{"_id": id},
+	).Decode(&poll); err != nil {
+		failure(c, 500, "Could not load updated results")
 		return
 	}
 
-	successResponse(c, http.StatusOK, gin.H{
+	success(c, 200, gin.H{
 		"message": "Vote submitted successfully",
 		"poll":    poll,
 	})
 }
 
-// ================= HEALTH CHECK =================
-
 func Health(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
+	success(c, 200, gin.H{
 		"status":  "ok",
 		"message": "Backend is running",
 	})
 }
 
-// ================= MAIN =================
-
 func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("Warning: .env file not found")
+	}
 
-	_ = godotenv.Load()
+	ginMode := os.Getenv("GIN_MODE")
+	if ginMode == "" {
+		ginMode = gin.ReleaseMode
+	}
+	switch ginMode {
+	case gin.DebugMode, gin.ReleaseMode, gin.TestMode:
+		gin.SetMode(ginMode)
+	default:
+		log.Fatal("GIN_MODE must be debug, release, or test")
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -520,109 +490,105 @@ func main() {
 	}
 
 	secret := os.Getenv("JWT_SECRET")
-
 	if len(secret) < 32 {
 		log.Fatal("JWT_SECRET must contain at least 32 characters")
 	}
-
 	jwtSecret = []byte(secret)
 
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		10*time.Second,
-	)
-	defer cancel()
+	frontendURL = os.Getenv("FRONTEND_URL")
+	if frontendURL == "" {
+		frontendURL = "http://localhost:5174"
+	}
+	frontendURL = strings.TrimRight(frontendURL, "/")
 
-	clientOptions := options.Client().ApplyURI(mongoURI)
-
-	mongoClient, err := mongo.Connect(ctx, clientOptions)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
 	if err != nil {
-		log.Fatal("MongoDB connection error: ", err)
+		cancel()
+		log.Fatal("MongoDB connection error:", err)
 	}
 
-	if err := mongoClient.Ping(ctx, nil); err != nil {
-		log.Fatal("MongoDB ping error: ", err)
+	if err := client.Ping(ctx, nil); err != nil {
+		cancel()
+		log.Fatal("MongoDB ping error:", err)
 	}
+	cancel()
 
 	defer func() {
-		disconnectCtx, disconnectCancel := context.WithTimeout(
-			context.Background(),
-			5*time.Second,
-		)
-		defer disconnectCancel()
-
-		_ = mongoClient.Disconnect(disconnectCtx)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := client.Disconnect(ctx); err != nil {
+			log.Println("MongoDB disconnect error:", err)
+		}
 	}()
 
 	log.Println("MongoDB connected successfully")
 
-	db := mongoClient.Database(dbName)
-
+	db := client.Database(dbName)
 	userCollection = db.Collection("users")
 	pollCollection = db.Collection("polls")
 
-	// Unique email index
+	indexCtx, indexCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_, err = userCollection.Indexes().CreateOne(
-		context.Background(),
+		indexCtx,
 		mongo.IndexModel{
-			Keys: bson.D{
-				{Key: "email", Value: 1},
-			},
+			Keys:    bson.D{{Key: "email", Value: 1}},
 			Options: options.Index().SetUnique(true),
 		},
 	)
+	indexCancel()
 
 	if err != nil {
-		log.Fatal("Could not create email index: ", err)
+		log.Fatal("Email index creation error:", err)
 	}
 
-	// Gin router
-	router := gin.Default()
+	router := gin.New()
+	if err := router.SetTrustedProxies(nil); err != nil {
+		log.Fatal("Trusted proxy configuration error:", err)
+	}
 
-	// CORS
-	router.Use(cors.New(cors.Config{
-		AllowOrigins: []string{
-			"http://localhost:5173",
-			"http://127.0.0.1:5173",
-		},
-		AllowMethods: []string{
-			"GET", "POST", "PUT", "DELETE", "OPTIONS",
-		},
-		AllowHeaders: []string{
-			"Origin", "Content-Type", "Authorization",
-		},
-		AllowCredentials: true,
-		MaxAge:           12 * time.Hour,
-	}))
+	router.Use(
+		gin.Logger(),
+		gin.Recovery(),
+		cors.New(cors.Config{
+			AllowOrigins: []string{
+				frontendURL,
+				"http://localhost:5174",
+				"http://127.0.0.1:5174",
+			},
+			AllowMethods: []string{
+				"GET",
+				"POST",
+				"PUT",
+				"DELETE",
+				"OPTIONS",
+			},
+			AllowHeaders: []string{
+				"Origin",
+				"Content-Type",
+				"Authorization",
+			},
+			AllowCredentials: true,
+		}),
+	)
 
-	// API routes
 	api := router.Group("/api")
-
 	api.GET("/health", Health)
-
-	// Authentication
 	api.POST("/auth/signup", Signup)
 	api.POST("/auth/login", Login)
 
-	// Public routes - no login
 	api.GET("/polls/:id", GetPublicPoll)
 	api.POST("/polls/:id/vote", SubmitPublicVote)
 
-	// Protected routes - login required
-	protected := api.Group("")
+	protected := api.Group("/")
 	protected.Use(AuthMiddleware())
-
 	protected.POST("/polls", CreatePoll)
 	protected.GET("/polls", GetPolls)
 
-	// Print all registered routes
-	for _, route := range router.Routes() {
-		log.Printf("REGISTERED: %s %s", route.Method, route.Path)
-	}
-
-	log.Println("Go server running on port " + port)
+	log.Println("Backend URL: http://localhost:" + port)
+	log.Println("Health URL: http://localhost:" + port + "/api/health")
 
 	if err := router.Run(":" + port); err != nil {
-		log.Fatal("Server error: ", err)
+		log.Fatal("Server error:", err)
 	}
 }
